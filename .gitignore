@@ -1,0 +1,8 @@
+resources/
+.conda/
+__pycache__/
+.vscode/
+
+.env
+logfile.txt
+Mapping_GeoInfoDok.md
