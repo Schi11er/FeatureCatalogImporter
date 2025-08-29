@@ -1,5 +1,9 @@
-import itertools
 import random
+import xml.etree.ElementTree as ET
+import uuid
+import logging
+from enum import Enum
+import time
 from GraphQLRequests import (
     create_tag,
     get_tag,
@@ -7,15 +11,9 @@ from GraphQLRequests import (
     create_catalog_entry,
     create_relationship,
 )
-import xml.etree.ElementTree as ET
-import uuid
-import logging
-from enum import Enum
 
 # Logfile zu Beginn leeren
 open("logfile.txt", "w").close()
-from concurrent.futures import ThreadPoolExecutor
-import time
 
 logging.basicConfig(
     level=logging.INFO,
@@ -167,6 +165,36 @@ def process_feature_type(level, collected_class_ids, tasks, relationship_tasks, 
 def log_unknown_schema_type(level, tag):
     logging.info(f"Unbekannter Schema-Typ [{level}]: {tag}")
 
+def create_relationship_with_retry(rel_args):
+    rel_type, properties, from_id, to_ids = rel_args
+    new_to_ids = []
+    for to_id in to_ids:
+        rel_key = (rel_type, from_id, to_id)
+        if rel_key in relation_lookup:
+            continue
+        relation_lookup.add(rel_key)
+        new_to_ids.append(to_id)
+    if new_to_ids:
+        max_retries = 5
+        for attempt in range(1, max_retries + 1):
+            try:
+                result = create_relationship(token, rel_type, properties, from_id, new_to_ids)
+                if result and isinstance(result, dict) and 'errors' in result:
+                    error_messages = str(result['errors'])
+                    if 'lock' in error_messages.lower() and attempt < max_retries:
+                        sleep_time = random.uniform(1, 5)
+                        time.sleep(sleep_time)
+                        continue
+                    logging.error(f"Fehler beim Anlegen der Beziehung: {error_messages}\nBeziehungsparameter: type={rel_type}, fromId={from_id}, toId={new_to_ids}")
+                break
+            except Exception as e:
+                if 'lock' in str(e).lower() and attempt < max_retries:
+                    sleep_time = random.uniform(1, 5)
+                    time.sleep(sleep_time)
+                    continue
+                logging.error(f"Fehler beim Anlegen der Beziehung: {e}\nBeziehungsparameter: type={rel_type}, fromId={from_id}, toId={new_to_ids}")
+                break
+                
 if __name__ == "__main__":
     start = time.time()
     # Login
@@ -251,58 +279,14 @@ if __name__ == "__main__":
     logging.info(f"Anzahl der Entities: {len(tasks)}")
     logging.info(f"Anzahl der Relationen: {len(relationship_tasks)}")
 
-    # Entities sequentiell anlegen
     for task in tasks:
         create_entry(task, relationship_tasks)
 
     logging.info(f"Dauer Erstellung Entities: {time.time() - start:.2f} Sekunden")
     start2 = time.time()
 
-    relation_jobs = []
     for rel_args in relationship_tasks:
-        rel_type, properties, from_id, to_ids = rel_args
-        new_to_ids = []
-        for to_id in to_ids:
-            rel_key = (rel_type, from_id, to_id)
-            if rel_key in relation_lookup:
-                continue
-            relation_lookup.add(rel_key)
-            new_to_ids.append(to_id)
-        if new_to_ids:
-            relation_jobs.append((rel_type, properties, from_id, new_to_ids))
-
-    def rel_worker(args):
-        rel_type, properties, from_id, to_ids = args
-        max_retries = 5
-        for attempt in range(1, max_retries + 1):
-            try:
-                result = create_relationship(token, rel_type, properties, from_id, to_ids)
-                if result and isinstance(result, dict) and 'errors' in result:
-                    error_messages = str(result['errors'])
-                    if 'lock' in error_messages.lower():
-                        if attempt < max_retries:
-                            sleep_time = random.uniform(1, 5)
-                            time.sleep(sleep_time)
-                            continue
-                        else:
-                            logging.error(f"Lock-Fehler nach {max_retries} Versuchen nicht behoben: {error_messages}\nBeziehungsparameter: type={rel_type}, fromId={from_id}, toId={to_id}")
-                    break
-                break
-            except Exception as e:
-                if 'lock' in str(e).lower():
-                    if attempt < max_retries:
-                        sleep_time = random.uniform(1, 5)
-                        time.sleep(sleep_time)
-                        continue
-                    else:
-                        logging.error(f"Lock-Fehler nach {max_retries} Versuchen nicht behoben: {e}\nBeziehungsparameter: type={rel_type}, fromId={from_id}, toId={to_id}")
-                        break
-                else:
-                    logging.error(f"Fehler beim Anlegen der Beziehung: {e}")
-                    break
-
-    for job in relation_jobs:
-        rel_worker(job)
+        create_relationship_with_retry(rel_args)
 
     logging.info(f"Dauer Erstellung Relationen: {time.time() - start2:.2f} Sekunden")
     logging.info(f"Gesamtdauer: {time.time() - start:.2f} Sekunden")
