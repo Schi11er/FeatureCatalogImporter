@@ -4,6 +4,8 @@ import uuid
 import logging
 from enum import Enum
 import time
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from GraphQLRequests import (
     create_tag,
     get_tag,
@@ -57,7 +59,7 @@ class XmlTag(Enum):
     def tag(self, ns):
         return f"{{{ns[self.value[0]]}}}{self.value[1]}"
 
-def find_datatype(attribute):
+def find_datatype(attribute, ns):
     name = getattr(attribute.find("valueTypeName", ns), "text", None)
     if name in ("CharacterString", "URI"):
         return "XTD_STRING"
@@ -76,6 +78,21 @@ def prepare_entity_attributes(domain, entity_type, ns):
     name = getattr(domain.find("gml:identifier", ns), "text", None)
     description = getattr(domain.find("gml:description", ns), "text", None)
     id = getattr(domain.find("gml:name", ns), "text", None)
+    
+    # Erweiterten Lookup-Key mit description erstellen
+    lookup_key = (name, entity_type.value[1], description)
+    
+    # Prüfen, ob Entity bereits existiert
+    if lookup_key in entity_lookup:
+        existing_id = entity_lookup[lookup_key]
+        return {
+            "id": existing_id,
+            "properties": None,  # Keine Properties, da bereits vorhanden
+            "entityType": entity_type,
+            "already_exists": True
+        }
+    
+    # Entity noch nicht vorhanden, neue erstellen
     properties = {"names": {"languageTag": "de", "value": name}}
     if description is not None:
         properties["descriptions"] = {"languageTag": "de", "value": description}
@@ -85,29 +102,39 @@ def prepare_entity_attributes(domain, entity_type, ns):
     #     properties["id"] = str(uuid.uuid4())
     properties["id"] = str(uuid.uuid4())
     if entity_type.value[1] == EntityType.MERKMAL.value[1]:
-        datatype = find_datatype(domain)
+        datatype = find_datatype(domain, ns)
         if datatype:
             properties["propertyProperties"] = {"dataType": datatype}
-    lookup_key = (name, entity_type.value[1], id)
-    # Direkt in die Lookup-Tabelle eintragen
+    
+    # In die Lookup-Tabelle eintragen
     entity_lookup[lookup_key] = properties["id"]
     return {
         "id": properties["id"],
         "properties": properties,
-        "entityType": entity_type
+        "entityType": entity_type,
+        "already_exists": False
     }
 
-def create_entry(attributes, relationship_tasks=None):
+def create_entry(attributes, token, tagId):
+    # Wenn Entity bereits existiert, nichts tun
+    if attributes.get("already_exists", False):
+        return attributes["id"] if attributes["entityType"] != EntityType.DICTIONARY else None
+    
     properties = attributes["properties"]
     entityType = attributes["entityType"]
-    result = create_catalog_entry(token, entityType.value[1], properties, [entityType.value[2], tagId])
-    if result and entityType != EntityType.DICTIONARY and relationship_tasks is not None:
-        relationship_tasks.append((RelType.DICTIONARY, None, properties["id"], [dictionaryId]))
-    return properties["id"]
+    try:
+        result = create_catalog_entry(token, entityType.value[1], properties, [entityType.value[2], tagId])
+        if entityType == EntityType.DICTIONARY:
+            return None  # Keine ID für Dictionary
+        return properties["id"]
+    except Exception as e:
+        logging.error(f"Fehler in create_entry: {e}, EntityType: {entityType}, Properties: {properties}")
+        raise
 
 def process_feature_type(level, collected_class_ids, tasks, relationship_tasks, ns, log_index):
     attrs = prepare_entity_attributes(level, EntityType.KLASSE, ns)
-    tasks.append((attrs))
+    if not attrs.get("already_exists", False):
+        tasks.append((attrs))
     collected_class_ids.append(attrs["id"])
 
     collected_property_ids = []
@@ -115,11 +142,13 @@ def process_feature_type(level, collected_class_ids, tasks, relationship_tasks, 
         sub_level = element[0]
         if sub_level.tag == XmlTag.FEATUREATTRIBUTE.tag(ns) or sub_level.tag == XmlTag.ASSOCIATIONROLE.tag(ns):
             prop_attrs = prepare_entity_attributes(sub_level, EntityType.MERKMAL, ns)
-            tasks.append((prop_attrs))
+            if not prop_attrs.get("already_exists", False):
+                tasks.append((prop_attrs))
             collected_property_ids.append(prop_attrs["id"])
 
             valList = False
             name = getattr(sub_level.find("valueTypeName", ns), "text", None)
+            # Wertelisten haben keine description, daher None verwenden
             value_list_lookup_key = (name, EntityType.WERTELISTE.value[1], None)
             if name and value_list_lookup_key in entity_lookup:
                 valListId = entity_lookup[value_list_lookup_key]
@@ -134,7 +163,8 @@ def process_feature_type(level, collected_class_ids, tasks, relationship_tasks, 
                 if val_level.tag == XmlTag.LISTEDVALUE.tag(ns):
                     valList = True
                     val_attrs = prepare_entity_attributes(val_level, EntityType.WERT, ns)
-                    tasks.append((val_attrs))
+                    if not val_attrs.get("already_exists", False):
+                        tasks.append((val_attrs))
                     relationship_tasks.append((RelType.VALUES, {"valueListProperties": {"order": order}}, valListId, [val_attrs["id"]]))
                     order += 1
                 else:
@@ -151,7 +181,8 @@ def process_feature_type(level, collected_class_ids, tasks, relationship_tasks, 
                             "id": valListId,
                             "valueListProperties": {"languageTag": "de"}
                         },
-                        "entityType": EntityType.WERTELISTE
+                        "entityType": EntityType.WERTELISTE,
+                        "already_exists": False
                     }
                     tasks.append((vAttrs))
                     entity_lookup[value_list_lookup_key] = valListId
@@ -204,7 +235,8 @@ if __name__ == "__main__":
     # Find or create tag
     tagId = "GeoInfoDokId"
     tagName = "GeoInfoDok"
-    file_path = "resources/aaa_mini.xml"
+    # file_path = "resources/aaa_mini.xml"
+    file_path = "resources/aaa.xml"
 
     tag = get_tag(token, tagId)
     # logging.info("Tag abgerufen:", tag)
@@ -226,13 +258,15 @@ if __name__ == "__main__":
     relation_lookup = set()  # (from_id, to_id, relationship_type)
     tasks = []
     relationship_tasks = []
+    entry_ids = []  # IDs die eine Dictionary-Beziehung benötigen
     # value_tasks wird nicht mehr benötigt
     
     rel_to_subj_props = {"relationshipToSubjectProperties": {"relationshipType": "XTD_SCHEMA_LEVEL"}}
 
     # Create Dictionary from FeatureCatalogue
     dictAttrs = prepare_entity_attributes(root, EntityType.DICTIONARY, ns)
-    dictionaryId = create_entry(dictAttrs, relationship_tasks)
+    create_entry(dictAttrs, token, tagId)
+    dictionaryId = dictAttrs["id"]
     # logging.info(f"Dictionary ID: {dictionaryId}")
 
     for child in root.findall(XmlTag.CONNECTOR.tag(ns)):
@@ -240,7 +274,8 @@ if __name__ == "__main__":
 
         if level1.tag == XmlTag.OBJEKTARTENBEREICH.tag(ns):
             attrs1 = prepare_entity_attributes(level1, EntityType.THEMA, ns)
-            tasks.append((attrs1))
+            if not attrs1.get("already_exists", False):
+                tasks.append((attrs1))
             collected_theme_ids = []
             collected_class_ids = []
 
@@ -248,7 +283,8 @@ if __name__ == "__main__":
                 level2 = element1[0]
                 if level2.tag == XmlTag.OBJEKTARTENGRUPPE.tag(ns):
                     attrs2 = prepare_entity_attributes(level2, EntityType.THEMA, ns)
-                    tasks.append((attrs2))
+                    if not attrs2.get("already_exists", False):
+                        tasks.append((attrs2))
                     collected_theme_ids.append(attrs2["id"])
 
                     collected_class_ids = []
@@ -279,14 +315,39 @@ if __name__ == "__main__":
     logging.info(f"Anzahl der Entities: {len(tasks)}")
     logging.info(f"Anzahl der Relationen: {len(relationship_tasks)}")
 
-    for task in tasks:
-        create_entry(task, relationship_tasks)
+    cpu_count = os.cpu_count()
+    optimal_workers = min(cpu_count * 3, 20)
+    
+    logging.info(f"CPU-Kerne: {cpu_count}, Verwende {optimal_workers} Worker")
 
-    logging.info(f"Dauer Erstellung Entities: {time.time() - start:.2f} Sekunden")
-    start2 = time.time()
+    start0 = time.time()
+    # Parallelisierte Entity-Erstellung
+    with ThreadPoolExecutor(max_workers=optimal_workers) as executor:
+        # Alle Tasks als Futures starten
+        future_to_task = {executor.submit(create_entry, task, token, tagId): task for task in tasks}
+        
+        # Ergebnisse sammeln
+        for future in as_completed(future_to_task):
+            try:
+                id = future.result()
+                if id:
+                    entry_ids.append(id)
+            except Exception as e:
+                task = future_to_task[future]
+                logging.error(f"Fehler bei Entity-Erstellung: {e}, Task: {task}")
 
-    for rel_args in relationship_tasks:
-        create_relationship_with_retry(rel_args)
+    logging.info(f"Dauer Erstellung Entities: {time.time() - start0:.2f} Sekunden")
+    
+    start1 = time.time()
+    # Dictionary-Beziehungen erstellen
+    for id in entry_ids:
+        create_relationship_with_retry((RelType.DICTIONARY, None, id, [dictionaryId]))
+    logging.info(f"Dauer Erstellung Dictionary-Relationen: {time.time() - start1:.2f} Sekunden")
+    
+    # start2 = time.time()
 
-    logging.info(f"Dauer Erstellung Relationen: {time.time() - start2:.2f} Sekunden")
+    # for rel_args in relationship_tasks:
+    #     create_relationship_with_retry(rel_args)
+
+    # logging.info(f"Dauer Erstellung Relationen: {time.time() - start2:.2f} Sekunden")
     logging.info(f"Gesamtdauer: {time.time() - start:.2f} Sekunden")
