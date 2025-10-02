@@ -6,13 +6,8 @@ from enum import Enum
 import time
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from GraphQLRequests import (
-    create_tag,
-    get_tag,
-    login,
-    create_catalog_entry,
-    create_relationship,
-)
+from GraphQLRequests import (add_tag, create_catalog_entry, create_relationship, create_tag,
+    get_tag, login)
 
 # Logfile zu Beginn leeren
 open("logfile.txt", "w").close()
@@ -89,7 +84,7 @@ def prepare_entity_attributes(domain, entity_type, ns):
             "id": existing_id,
             "properties": None,  # Keine Properties, da bereits vorhanden
             "entityType": entity_type,
-            "already_exists": True
+            "is_new": False
         }
     
     # Entity noch nicht vorhanden, neue erstellen
@@ -112,18 +107,34 @@ def prepare_entity_attributes(domain, entity_type, ns):
         "id": properties["id"],
         "properties": properties,
         "entityType": entity_type,
-        "already_exists": False
+        "is_new": True
     }
 
 def create_entry(attributes, token, tagId):
-    # Wenn Entity bereits existiert, nichts tun
-    if attributes.get("already_exists", False):
-        return attributes["id"] if attributes["entityType"] != EntityType.DICTIONARY else None
-    
     properties = attributes["properties"]
     entityType = attributes["entityType"]
     try:
         result = create_catalog_entry(token, entityType.value[1], properties, [entityType.value[2], tagId])
+        if result is None:
+            # Retry-Logik für add_tag
+            max_retries = 5
+            addTag = None
+            
+            for attempt in range(1, max_retries + 1):
+                addTag = add_tag(token, properties["id"], tagId)
+                if addTag is not None:
+                    logging.info(f"Tag für '{properties['names']['value']}' erfolgreich hinzugefügt nach Versuch {attempt}")
+                    break
+                
+                if attempt < max_retries:
+                    wait_time = attempt * 0.5  # Progressiv längere Wartezeit
+                    time.sleep(wait_time)
+                else:
+                    # Alle Versuche fehlgeschlagen
+                    error_msg = f"add_tag fehlgeschlagen nach {max_retries} Versuchen für Entity {properties['names']['value']} (ID: {properties['id']})"
+                    logging.error(error_msg)
+                    raise Exception(error_msg)
+        
         if entityType == EntityType.DICTIONARY:
             return None  # Keine ID für Dictionary
         return properties["id"]
@@ -133,8 +144,8 @@ def create_entry(attributes, token, tagId):
 
 def process_feature_type(level, collected_class_ids, tasks, relationship_tasks, ns, log_index):
     attrs = prepare_entity_attributes(level, EntityType.KLASSE, ns)
-    if not attrs.get("already_exists", False):
-        tasks.append((attrs))
+    if attrs.get("is_new", True):
+        tasks.append(attrs)
     collected_class_ids.append(attrs["id"])
 
     collected_property_ids = []
@@ -142,8 +153,8 @@ def process_feature_type(level, collected_class_ids, tasks, relationship_tasks, 
         sub_level = element[0]
         if sub_level.tag == XmlTag.FEATUREATTRIBUTE.tag(ns) or sub_level.tag == XmlTag.ASSOCIATIONROLE.tag(ns):
             prop_attrs = prepare_entity_attributes(sub_level, EntityType.MERKMAL, ns)
-            if not prop_attrs.get("already_exists", False):
-                tasks.append((prop_attrs))
+            if prop_attrs.get("is_new", True):
+                tasks.append(prop_attrs)
             collected_property_ids.append(prop_attrs["id"])
 
             valList = False
@@ -163,8 +174,8 @@ def process_feature_type(level, collected_class_ids, tasks, relationship_tasks, 
                 if val_level.tag == XmlTag.LISTEDVALUE.tag(ns):
                     valList = True
                     val_attrs = prepare_entity_attributes(val_level, EntityType.WERT, ns)
-                    if not val_attrs.get("already_exists", False):
-                        tasks.append((val_attrs))
+                    if val_attrs.get("is_new", True):
+                        tasks.append(val_attrs)
                     relationship_tasks.append((RelType.VALUES, {"valueListProperties": {"order": order}}, valListId, [val_attrs["id"]]))
                     order += 1
                 else:
@@ -182,9 +193,9 @@ def process_feature_type(level, collected_class_ids, tasks, relationship_tasks, 
                             "valueListProperties": {"languageTag": "de"}
                         },
                         "entityType": EntityType.WERTELISTE,
-                        "already_exists": False
+                        "is_new": True
                     }
-                    tasks.append((vAttrs))
+                    tasks.append(vAttrs)
                     entity_lookup[value_list_lookup_key] = valListId
                     relationship_tasks.append((RelType.POSSIBLE_VALUES, None, prop_attrs["id"], [valListId]))
                 else:
@@ -195,6 +206,71 @@ def process_feature_type(level, collected_class_ids, tasks, relationship_tasks, 
 
 def log_unknown_schema_type(level, tag):
     logging.info(f"Unbekannter Schema-Typ [{level}]: {tag}")
+
+def dict_to_hashable(obj):
+    """
+    Konvertiert ein Dictionary (auch verschachtelt) zu einem hashbaren Tupel.
+    """
+    if obj is None:
+        return None
+    elif isinstance(obj, dict):
+        return tuple(sorted((k, dict_to_hashable(v)) for k, v in obj.items()))
+    elif isinstance(obj, list):
+        return tuple(dict_to_hashable(item) for item in obj)
+    else:
+        return obj
+
+def hashable_to_dict(obj):
+    """
+    Konvertiert ein hashbares Tupel zurück zu einem Dictionary.
+    """
+    if obj is None:
+        return None
+    elif isinstance(obj, tuple) and len(obj) > 0 and isinstance(obj[0], tuple) and len(obj[0]) == 2:
+        # Es ist ein Dictionary-Tupel
+        return {k: hashable_to_dict(v) for k, v in obj}
+    else:
+        return obj
+
+def optimize_relationship_tasks(relationship_tasks):
+    """
+    Optimiert relationship_tasks, indem Einträge mit gleichen (relationship_type, props, from_id) 
+    zusammengeführt werden und die to_ids in einem Array gesammelt werden.
+    """
+    # Dictionary zum Sammeln der optimierten Relationships
+    # Key: (relationship_type, props_hash, from_id)
+    # Value: set of to_ids
+    optimized = {}
+    
+    for rel_type, props, from_id, to_ids in relationship_tasks:
+        # Props zu einem hashbaren Wert konvertieren (für Dictionary-Key)
+        props_key = dict_to_hashable(props)
+        
+        # Schlüssel für die Gruppierung erstellen
+        key = (rel_type, props_key, from_id)
+        
+        # to_ids zu einem Set hinzufügen (um Duplikate zu vermeiden)
+        if key not in optimized:
+            optimized[key] = set()
+        
+        # Alle to_ids hinzufügen
+        if isinstance(to_ids, list):
+            optimized[key].update(to_ids)
+        else:
+            optimized[key].add(to_ids)
+    
+    # Zurück zu der ursprünglichen Struktur konvertieren
+    result = []
+    for (rel_type, props_key, from_id), to_ids_set in optimized.items():
+        # props_key zurück zu Dictionary konvertieren
+        props = hashable_to_dict(props_key)
+        
+        # Set zurück zu List konvertieren
+        to_ids_list = list(to_ids_set)
+        
+        result.append((rel_type, props, from_id, to_ids_list))
+    
+    return result
 
 def create_relationship_with_retry(rel_args):
     rel_type, properties, from_id, to_ids = rel_args
@@ -242,8 +318,15 @@ if __name__ == "__main__":
     # logging.info("Tag abgerufen:", tag)
     if not tag:
         logging.info("Tag nicht gefunden, erstelle neuen Tag.")
-        create_tag(token, tagName, tagId)
-        logging.info("Tag erstellt:", tag)
+        tag = create_tag(token, tagName, tagId)
+        logging.info(f"Tag erstellt: {tag}")
+    
+    # Validierung, dass tagId korrekt ist
+    if tagId is None:
+        logging.error("tagId ist None - kann nicht fortfahren")
+        exit(1)
+    
+    logging.info(f"Verwende tagId: {tagId}")
 
     ns = {}
     for event, elem in ET.iterparse(file_path, events=("start-ns", "start")):
@@ -254,12 +337,11 @@ if __name__ == "__main__":
     root = tree.getroot()
 
     # Lookup-Tabellen und Task Sammlungen für Entities und Relationen
-    entity_lookup = {}  # (name, typ) -> id
-    relation_lookup = set()  # (from_id, to_id, relationship_type)
-    tasks = []
-    relationship_tasks = []
+    entity_lookup = {}  # (name, typ, description) -> id
+    relation_lookup = set()  # (relationship_type, from_id, [to_ids])
+    tasks = [] # List of entity dictionaries: {id, properties, entityType, is_new}
+    relationship_tasks = [] # (relationship_type, props, from_id, [to_ids])
     entry_ids = []  # IDs die eine Dictionary-Beziehung benötigen
-    # value_tasks wird nicht mehr benötigt
     
     rel_to_subj_props = {"relationshipToSubjectProperties": {"relationshipType": "XTD_SCHEMA_LEVEL"}}
 
@@ -274,8 +356,8 @@ if __name__ == "__main__":
 
         if level1.tag == XmlTag.OBJEKTARTENBEREICH.tag(ns):
             attrs1 = prepare_entity_attributes(level1, EntityType.THEMA, ns)
-            if not attrs1.get("already_exists", False):
-                tasks.append((attrs1))
+            if attrs1.get("is_new", True):
+                tasks.append(attrs1)
             collected_theme_ids = []
             collected_class_ids = []
 
@@ -283,8 +365,8 @@ if __name__ == "__main__":
                 level2 = element1[0]
                 if level2.tag == XmlTag.OBJEKTARTENGRUPPE.tag(ns):
                     attrs2 = prepare_entity_attributes(level2, EntityType.THEMA, ns)
-                    if not attrs2.get("already_exists", False):
-                        tasks.append((attrs2))
+                    if attrs2.get("is_new", True):
+                        tasks.append(attrs2)
                     collected_theme_ids.append(attrs2["id"])
 
                     collected_class_ids = []
@@ -313,11 +395,16 @@ if __name__ == "__main__":
 
 
     logging.info(f"Anzahl der Entities: {len(tasks)}")
-    logging.info(f"Anzahl der Relationen: {len(relationship_tasks)}")
+    logging.info(f"Anzahl der Relationen vor Optimierung: {len(relationship_tasks)}")
 
+    # Relationship-Tasks optimieren (zusammenführen)
+    relationship_tasks = optimize_relationship_tasks(relationship_tasks)
+    logging.info(f"Anzahl der Relationen nach Optimierung: {len(relationship_tasks)}")
+
+    # Optimale Anzahl an Threads
     cpu_count = os.cpu_count()
-    optimal_workers = min(cpu_count * 3, 20)
-    
+    optimal_workers = min(cpu_count*3, 20)
+
     logging.info(f"CPU-Kerne: {cpu_count}, Verwende {optimal_workers} Worker")
 
     start0 = time.time()
@@ -344,10 +431,10 @@ if __name__ == "__main__":
         create_relationship_with_retry((RelType.DICTIONARY, None, id, [dictionaryId]))
     logging.info(f"Dauer Erstellung Dictionary-Relationen: {time.time() - start1:.2f} Sekunden")
     
-    # start2 = time.time()
+    start2 = time.time()
 
-    # for rel_args in relationship_tasks:
-    #     create_relationship_with_retry(rel_args)
+    for rel_args in relationship_tasks:
+        create_relationship_with_retry(rel_args)
 
-    # logging.info(f"Dauer Erstellung Relationen: {time.time() - start2:.2f} Sekunden")
+    logging.info(f"Dauer Erstellung Relationen: {time.time() - start2:.2f} Sekunden")
     logging.info(f"Gesamtdauer: {time.time() - start:.2f} Sekunden")

@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 from dotenv import load_dotenv
 import logging
@@ -41,8 +42,8 @@ def create_catalog_entry(token, catalogEntryType, properties, tagId):
 	"""
 	variables = {"input": {"catalogEntryType": catalogEntryType, "properties": properties, "tags": tagId}}
 	result = graphql_request(query, variables, token)
-	if "error" in result:
-		logging.error(f"Fehler beim Erstellen des Katalogeintrags: {result}")
+	if "errors" in result:
+		# logging.error(f"Fehler beim Erstellen des Katalogeintrags: {result}")
 		return None
 	else:
 		return result["data"]["createCatalogEntry"]["catalogEntry"]
@@ -93,3 +94,19 @@ def get_tag(token, tagId):
 		return None
 	else:
 		return result["data"]["getTag"]
+
+def add_tag(token, entryId, tagId):
+	query = """
+	mutation AddTag($input: AddTagInput!) {
+		addTag(input: $input) {
+			catalogEntry { __typename }
+		}
+	}
+	"""
+	variables = {"input": {"catalogEntryId": entryId, "tagId": tagId}}
+	result = graphql_request(query, variables, token)
+	if "errors" in result:
+		logging.error(f"Fehler beim Hinzufügen des Tags: {result}")
+		return None
+	else:
+		return result["data"]["addTag"]["catalogEntry"]
